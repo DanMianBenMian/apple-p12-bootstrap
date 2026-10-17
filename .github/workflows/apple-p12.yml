@@ -106,9 +106,13 @@ jobs:
           pass = ENV['FASTLANE_PASSWORD']
 
           logged_in = false
+          client = nil
           begin
             puts(">> portal login as #{user}")
-            Spaceship::PortalClient.login(user, pass)
+            # NOTE: the class method builds an anonymous instance internally, so we must
+            # keep our own handle - the cookie jar lives on the instance, not the class.
+            client = Spaceship::Client.new
+            client.login(user, pass)
             logged_in = true
             puts(">> PORTAL LOGIN OK")
           rescue => e
@@ -116,55 +120,30 @@ jobs:
             puts(e.backtrace.first(12).join("\n"))
           end
 
-          if logged_in
+          if logged_in && client
             require 'net/http'
             require 'uri'
-            cookie = Spaceship::PortalClient.instance_variable_get(:@cookie).to_s
-            jar = Spaceship::Client.instance_variable_get(:@cookie)
-            # The developer portal needs its own session (myacinfo / acn01).
-            # Visiting the account page after login completes that handshake.
+            # Correct cookie header: join each cookie's to_s
+            cookie_header = proc { client.cookie.map(&:to_s).join(';') }
+            puts(">> COOKIE NAMES: " + client.cookie.map { |c| c.respond_to?(:name) ? c.name : '?' }.join(','))
             ['https://developer.apple.com/account/',
-             'https://developer.apple.com/services-account/QH65B2/account/getTeams'].each do |u|
+             'https://developer.apple.com/services-account/QH65B2/account/getTeams',
+             "https://developer.apple.com/services-account/QH65B2/listTeams.action",
+             "https://developer.apple.com/services-account/QH65B2/listCertificates.action"].each do |u|
               begin
                 uri = URI(u)
                 res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
                   req = Net::HTTP::Get.new(uri.request_uri)
-                  req['Cookie'] = jar.map { |c| "#{c.name}=#{c.value}" }.join('; ')
+                  req['Cookie'] = cookie_header.call
                   req['User-Agent'] = 'Mozilla/5.0'
                   req['X-Requested-With'] = 'XMLHttpRequest'
                   req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
                   h.request(req)
                 end
                 puts(">> VISIT #{u} -> #{res.code} (#{res.body.to_s.length}B)")
-                if res.code == '302' || res.code == '301'
-                  puts(">>   redirect: #{res['Location']}")
-                end
-                if u.include?('getTeams')
-                  puts(">> TEAMS RAW: #{res.body.to_s[0, 1500]}")
-                end
+                puts(">> BODY #{u.split('/').last}: #{res.body.to_s[0, 1200]}")
               rescue => e
                 puts(">> VISIT #{u} ERROR #{e.class}: #{e.to_s[0,200]}")
-              end
-            end
-            # dump which cookies we actually hold
-            puts(">> COOKIES: " + jar.map { |c| c.name }.join(','))
-            [
-              "/services-account/QH65B2/listTeams.action",
-              "/services-account/QH65B2/listCertificates.action",
-            ].each do |path|
-              begin
-                uri = URI("https://developer.apple.com#{path}")
-                res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
-                  req = Net::HTTP::Get.new(uri.request_uri)
-                  req['Cookie'] = jar.map { |c| "#{c.name}=#{c.value}" }.join('; ')
-                  req['X-Requested-With'] = 'XMLHttpRequest'
-                  req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
-                  req['User-Agent'] = 'Mozilla/5.0'
-                  h.request(req)
-                end
-                puts(">> EP #{path} [#{res.code}]: #{res.body.to_s[0, 1500]}")
-              rescue => e
-                puts(">> EP #{path} ERROR #{e.class}: #{e.to_s[0,200]}")
               end
             end
           end
@@ -235,7 +214,7 @@ jobs:
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|VISIT |TEAMS RAW|COOKIES:|EP /services|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|COOKIE NAMES|VISIT |BODY |DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
           echo "=== XCODE PHASE ==="
           cat "$RUNNER_TEMP/xcode.log" 2>/dev/null | head -30 || echo "(no xcode.log)"
           echo "=== CERT PHASE ==="
