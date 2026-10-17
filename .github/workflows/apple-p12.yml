@@ -10,7 +10,7 @@ on:
 jobs:
   make-cert:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -66,8 +66,8 @@ jobs:
           head -3 /tmp/poll_2fa.py
           echo "installer ok"
 
-      - name: Login + create development certificate
-        timeout-minutes: 15
+      - name: Login + handshake + create development certificate (.p12)
+        timeout-minutes: 25
         env:
           FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           FASTLANE_DONT_STORE_PASSWORD: '1'
@@ -80,77 +80,142 @@ jobs:
           cat > runner.rb <<'RUBY'
           require 'spaceship'
           require 'timeout'
+          require 'openssl'
+          require 'base64'
+          require 'fileutils'
+          require 'net/http'
+          require 'uri'
 
+          # ---- 2FA: poll the python poller instead of prompting ----
           module TwoStepPoll
-            def ask_for_2fa_code(msg)
+            def ask_for_2fa_code(msg = nil)
               n = (self.instance_variable_get(:@poll_depth) || 0)
               self.instance_variable_set(:@poll_depth, n + 1)
               puts(">> 2FA needed (attempt #{n + 1}); shelling out to python poller")
-              out = IO.popen({'CODE_WAIT_SECONDS' => '420'}, ['python3', '/tmp/poll_2fa.py'], &:read)
+              out = IO.popen({ 'CODE_WAIT_SECONDS' => '420' }, ['python3', '/tmp/poll_2fa.py'], &:read)
               code = out.to_s.lines.last.to_s.strip
               puts(">> poller returned #{code.inspect}")
               code =~ /\A[0-9]{6}\z/ ? code : '000000'
             end
           end
-
           Spaceship::Client.prepend(TwoStepPoll)
           Spaceship::Client.class_eval do
             def itc_service_key
               @service_key ||= ENV['APPLE_WIDGET_KEY']
             end
           end
+
           $stdout.sync = true
           puts(">> patches applied")
 
           user = ENV['APPLE_ID']
           pass = ENV['FASTLANE_PASSWORD']
+          rt   = ENV['RUNNER_TEMP'] || '/tmp'
 
-          logged_in = false
-          client = nil
+          client = Spaceship::PortalClient.login(user, pass)
+          puts(">> PORTAL LOGIN OK (#{client.class})")
+
+          # Point the Portal singleton at our authenticated instance so
+          # ensure_csrf -> Certificate.all uses the same session.
           begin
-            puts(">> portal login as #{user}")
-            # Spaceship::Client is abstract (no self.hostname). PortalClient implements it.
-            # PortalClient.login (class method) returns the instance that holds @cookie.
-            client = Spaceship::PortalClient.login(user, pass)
-            logged_in = true
-            puts(">> PORTAL LOGIN OK (#{client.class})")
-          rescue => e
-            puts(">> PORTAL LOGIN ERROR #{e.class}: #{e.to_s[0,600]}")
-            puts(e.backtrace.first(12).join("\n"))
+            Spaceship::Portal.client = client
+          rescue NoMethodError
+            Spaceship::Portal.singleton_class.class_eval { attr_accessor :client }
+            Spaceship::Portal.client = client
           end
 
-          if logged_in && client
-            require 'net/http'
-            require 'uri'
-            # Correct cookie header: join each cookie's to_s
-            cookie_header = proc { client.cookie.map(&:to_s).join(';') }
-            puts(">> COOKIE NAMES: " + client.cookie.map { |c| c.respond_to?(:name) ? c.name : '?' }.join(','))
-            ['https://developer.apple.com/account/',
-             'https://developer.apple.com/services-account/QH65B2/account/getTeams',
-             "https://developer.apple.com/services-account/QH65B2/listTeams.action",
-             "https://developer.apple.com/services-account/QH65B2/listCertificates.action"].each do |u|
+          jar = client.instance_variable_get(:@cookie)
+          cookie_dump = proc { jar.map { |c| c.respond_to?(:name) ? c.name : '?' }.join(',') }
+          puts(">> COOKIE NAMES (pre-handshake): " + cookie_dump.call)
+
+          # ---- Handshake: establish developer.apple.com session (myacinfo/acn01) ----
+          def full_cookie_header(jar)
+            jar.map { |c| c.to_s }.join('; ')
+          end
+          def merge_set_cookie(jar, set_cookie_array, host)
+            (set_cookie_array || []).each do |sc|
               begin
-                uri = URI(u)
-                res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
-                  req = Net::HTTP::Get.new(uri.request_uri)
-                  req['Cookie'] = cookie_header.call
-                  req['User-Agent'] = 'Mozilla/5.0'
-                  req['X-Requested-With'] = 'XMLHttpRequest'
-                  req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
-                  h.request(req)
-                end
-                puts(">> VISIT #{u} -> #{res.code} (#{res.body.to_s.length}B)")
-                puts(">> BODY #{u.split('/').last}: #{res.body.to_s[0, 1200]}")
+                jar.parse(sc, URI(host))
               rescue => e
-                puts(">> VISIT #{u} ERROR #{e.class}: #{e.to_s[0,200]}")
+                puts(">>   set-cookie parse skip: #{e.class}: #{e.to_s[0,120]}")
               end
             end
           end
-          puts(">> DONE logged_in=#{logged_in}")
+
+          puts(">> handshake GET https://developer.apple.com/account/ ...")
+          begin
+            uri = URI('https://developer.apple.com/account/')
+            res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 20, read_timeout: 40) do |h|
+              req = Net::HTTP::Get.new(uri.request_uri)
+              req['Cookie'] = full_cookie_header(jar)
+              req['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+              req['Accept'] = '*/*'
+              h.request(req)
+            end
+            puts(">> handshake status #{res.code}")
+            merge_set_cookie(jar, res.get_fields('set-cookie'), 'https://developer.apple.com')
+            puts(">> COOKIE NAMES (post-handshake): " + cookie_dump.call)
+            if res.code.to_i == 302 && (loc = res['location'])
+              puts(">> handshake redirected -> #{loc}")
+            end
+          rescue => e
+            puts(">> handshake ERROR #{e.class}: #{e.to_s[0, 300]}")
+          end
+
+          # ---- listTeams (raw diagnostic) ----
+          begin
+            resp = client.client.get('https://developer.apple.com/services-account/QH65B2/account/listTeams.action')
+            puts(">> listTeams.status=#{resp.status}")
+            puts(">> listTeams.body=#{resp.body.to_s[0, 1600]}")
+          rescue => e
+            puts(">> listTeams ERROR #{e.class}: #{e.to_s[0, 300]}")
+          end
+
+          # ---- teams via spaceship (raises if 0) ----
+          teams = []
+          begin
+            teams = client.teams
+            puts(">> teams.count=#{teams.count}")
+            teams.each { |t| puts(">>   team: name=#{t['name']} id=#{t['teamId']} type=#{t['type']}") }
+          rescue => e
+            puts(">> client.teams ERROR #{e.class}: #{e.to_s[0, 300]}")
+          end
+
+          if teams.count > 0
+            team = teams.first
+            client.team_id = team['teamId']
+            puts(">> selected team id=#{team['teamId']} name=#{team['name']}")
+            begin
+              csr, pkey = Spaceship::Portal::Certificate.create_certificate_signing_request
+              puts(">> CSR + key generated")
+              response = client.create_certificate!('5QPB9NHCEI', csr.to_pem, nil, false)
+              puts(">> create_certificate! keys=#{response.keys.inspect}")
+              response['certificateTypeDisplayId'] = response['certificateType']['certificateTypeDisplayId'] rescue nil
+              cert = Spaceship::Portal::Certificate.factory(response)
+              raw  = client.download_certificate(cert.id, cert.type_display_id, mac: false)
+              cer_path = File.join(rt, 'dev.cer')
+              File.write(cer_path, raw)
+              puts(">> downloaded cert #{raw.length}B -> #{cer_path}")
+              key_path = File.join(rt, 'dev_key.pem')
+              File.write(key_path, pkey.to_pem)
+              p12_path = File.join(rt, 'dev.p12')
+              ok = system("openssl pkcs12 -export -out \"#{p12_path}\" -inkey \"#{key_path}\" -in \"#{cer_path}\" -passout pass: -name \"iOS Development\"")
+              puts(ok ? ">> p12 exported -> #{p12_path}" : ">> p12 export FAILED (openssl rc=#{$?.exitstatus})")
+              puts(">> cert subject: " + `openssl x509 -in \"#{cer_path}\" -noout -subject -dates -serial 2>/dev/null`.strip)
+            rescue => e
+              puts(">> CERT CREATE ERROR #{e.class}: #{e.to_s[0, 500]}")
+              puts(e.backtrace.first(10).join("\n"))
+            end
+          else
+            puts(">> NO TEAM -> cannot create cert this run")
+          end
+
+          puts(">> DONE")
           RUBY
           ruby -c runner.rb && echo "RUBY SYNTAX OK"
-          printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee cert.log
-          cp cert.log "$RUNNER_TEMP/" 2>/dev/null || true
+          printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee "$RUNNER_TEMP/cert.log"
+          echo "=== artifacts in RUNNER_TEMP ==="
+          ls -la "$RUNNER_TEMP" | grep -E 'cert.log|dev\.' || echo "(none yet)"
 
       - name: Xcode path - does it see a Personal Team?
         if: always()
@@ -163,61 +228,20 @@ jobs:
           security find-identity -v -p codesigning 2>&1 | head -20
           echo "=== existing provisioning profiles ==="
           ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>/dev/null || echo "(none)"
-          echo "=== xcodebuild first-launch state ==="
-          xcodebuild -runFirstLaunch 2>&1 | tail -5
-          cp /dev/null "$RUNNER_TEMP/xcode.log" 2>/dev/null || true
           {
             echo "xcodebuild: $(xcodebuild -version 2>&1 | tr '\n' ' ')"
             echo "identities:"; security find-identity -v -p codesigning 2>&1 | head -20
           } > "$RUNNER_TEMP/xcode.log" 2>&1
 
-      - name: Create certificate via fastlane cert
-        env:
-          FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          FASTLANE_DONT_STORE_PASSWORD: '1'
-          FASTLANE_OPT_OUT_USAGE: '1'
-          FASTLANE_IS_INTERACTIVE: 'true'
-          TFA_CODE_SEED: ${{ inputs.tfa_code }}
-        run: |
-          set +e
-          WORK=$(mktemp -d); cd "$WORK"
-          cat > patch2.rb <<'RUBY'
-          require 'spaceship'
-          module TwoStepPoll
-            def ask_for_2fa_code(msg)
-              puts(">> 2FA needed; shelling out to python poller")
-              out = IO.popen({'CODE_WAIT_SECONDS' => '420'}, ['python3', '/tmp/poll_2fa.py'], &:read)
-              code = out.to_s.lines.last.to_s.strip
-              puts(">> poller returned #{code.inspect}")
-              code =~ /\A[0-9]{6}\z/ ? code : '000000'
-            end
-          end
-          Spaceship::Client.prepend(TwoStepPoll)
-          Spaceship::Client.class_eval do
-            def itc_service_key
-              @service_key ||= ENV['APPLE_WIDGET_KEY']
-            end
-          end
-          RUBY
-          ruby -c patch2.rb && echo "RUBY SYNTAX OK"
-          printf '%s\n' "$FASTLANE_PASSWORD" | \
-            ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
-          echo "=== files ==="
-          ls -la
-          for c in *.cer *.p12; do
-            [ -f "$c" ] && echo "--- $c ---" && openssl x509 -in "$c" -noout -subject -dates -serial 2>/dev/null
-          done
-          cp cert2.log "$RUNNER_TEMP/" 2>/dev/null || true
-
       - name: Summary
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|COOKIE NAMES|VISIT |BODY |DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|COOKIE NAMES|handshake|listTeams|teams.count|team:|selected team|CERT CREATE|p12 exported|cert subject|DONE|NO TEAM|ERROR' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -60
           echo "=== XCODE PHASE ==="
           cat "$RUNNER_TEMP/xcode.log" 2>/dev/null | head -30 || echo "(no xcode.log)"
-          echo "=== CERT PHASE ==="
-          grep -inE '2FA needed|poller returned|GOT CODE|successfully|created|TIMED OUT|Incorrect|Unauthorized|certificate' "$RUNNER_TEMP/cert2.log" 2>/dev/null | head -40
+          echo "=== ARTIFACTS ==="
+          ls -la "$RUNNER_TEMP" | grep -E 'dev\.|\.log' || echo "(no cert artifacts)"
 
       - name: Upload artifacts
         if: always()
@@ -226,6 +250,6 @@ jobs:
           name: apple-cert-output
           path: |
             ${{ runner.temp }}/*.log
-            *.cer
-            *.p12
+            ${{ runner.temp }}/*.cer
+            ${{ runner.temp }}/*.p12
           if-no-files-found: warn
