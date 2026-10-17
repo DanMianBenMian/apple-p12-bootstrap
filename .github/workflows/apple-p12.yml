@@ -1,0 +1,52 @@
+name: apple-free-p12
+on:
+  workflow_dispatch:
+    inputs:
+      tfa_code:
+        description: '2FA code from trusted device (fresh - get it right before running)'
+        required: true
+
+jobs:
+  make-cert:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      APPLE_ID: mocswpkddhxa@aniimate.net
+    steps:
+      - name: Recon - toolchain + DS2 team endpoints in Xcode
+        run: |
+          echo "=== Xcode ==="; xcodebuild -version 2>&1 | head -3
+          echo "=== fastlane ==="; fastlane --version 2>&1 | head -2
+          echo "=== DS2 team-related action names inside Xcode ==="
+          for fw in /Applications/Xcode.app/Contents/SharedFrameworks/DVTFoundation.framework /Applications/Xcode.app/Contents/Frameworks; do
+            grep -rhaoE '[a-zA-Z]{3,40}[Tt]eam[a-zA-Z]{0,20}\.action' "$fw" 2>/dev/null
+          done | sort -u | head -20
+          echo "=== grep createTeam/enroll strings ==="
+          grep -rhaoE '(createTeam|enrollTeam|joinTeam|personalTeam)[A-Za-z]{0,20}' /Applications/Xcode.app/Contents/ 2>/dev/null | sort -u | head -10
+          echo "=== recon done ==="
+
+      - name: fastlane login + create development certificate
+        env:
+          FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          FASTLANE_DONT_STORE_PASSWORD: '1'
+        run: |
+          set -x
+          WORK=$(mktemp -d); cd "$WORK"
+          printf '%s\n%s\n' "$FASTLANE_PASSWORD" "${{ inputs.tfa_code }}" | \
+            fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tail -60
+          echo "=== produced files ==="
+          ls -la
+          for c in *.cer; do
+            [ -f "$c" ] && openssl x509 -in "$c" -noout -subject -dates -serial
+          done
+
+      - name: Upload artifacts (cert / p12 / logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-cert-output
+          path: |
+            *.p12
+            *.cer
+            *.log
+          if-no-files-found: warn
