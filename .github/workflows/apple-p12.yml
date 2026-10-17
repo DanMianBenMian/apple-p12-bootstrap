@@ -117,28 +117,52 @@ jobs:
           end
 
           if logged_in
-            begin
-              File.write('/tmp/fastlane_session.txt', Spaceship::PortalClient.instance_variable_get(:@cookie).to_s) rescue nil
-            rescue
-            end
             require 'net/http'
             require 'uri'
             cookie = Spaceship::PortalClient.instance_variable_get(:@cookie).to_s
-            # The real Quartz-HTTP endpoint the dev portal uses
-            ["/services-account/QH65B2/listTeams.action",
-             "/services-account/QH65B2/account/getTeams",
-             "/services-account/QH65B2/listCertificates.action"].each do |path|
+            jar = Spaceship::Client.instance_variable_get(:@cookie)
+            # The developer portal needs its own session (myacinfo / acn01).
+            # Visiting the account page after login completes that handshake.
+            ['https://developer.apple.com/account/',
+             'https://developer.apple.com/services-account/QH65B2/account/getTeams'].each do |u|
               begin
-                uri = URI("https://developer.apple.com#{path}")
-                req = Net::HTTP::Get.new(uri.request_uri)
-                req['Cookie'] = cookie
-                req['X-Requested-With'] = 'XMLHttpRequest'
-                req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
-                req['User-Agent'] = 'fastlane'
+                uri = URI(u)
                 res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
+                  req = Net::HTTP::Get.new(uri.request_uri)
+                  req['Cookie'] = jar.map { |c| "#{c.name}=#{c.value}" }.join('; ')
+                  req['User-Agent'] = 'Mozilla/5.0'
+                  req['X-Requested-With'] = 'XMLHttpRequest'
+                  req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
                   h.request(req)
                 end
-                puts(">> EP #{path} [#{res.code}]: #{res.body.to_s[0, 1200]}")
+                puts(">> VISIT #{u} -> #{res.code} (#{res.body.to_s.length}B)")
+                if res.code == '302' || res.code == '301'
+                  puts(">>   redirect: #{res['Location']}")
+                end
+                if u.include?('getTeams')
+                  puts(">> TEAMS RAW: #{res.body.to_s[0, 1500]}")
+                end
+              rescue => e
+                puts(">> VISIT #{u} ERROR #{e.class}: #{e.to_s[0,200]}")
+              end
+            end
+            # dump which cookies we actually hold
+            puts(">> COOKIES: " + jar.map { |c| c.name }.join(','))
+            [
+              "/services-account/QH65B2/listTeams.action",
+              "/services-account/QH65B2/listCertificates.action",
+            ].each do |path|
+              begin
+                uri = URI("https://developer.apple.com#{path}")
+                res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
+                  req = Net::HTTP::Get.new(uri.request_uri)
+                  req['Cookie'] = jar.map { |c| "#{c.name}=#{c.value}" }.join('; ')
+                  req['X-Requested-With'] = 'XMLHttpRequest'
+                  req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
+                  req['User-Agent'] = 'Mozilla/5.0'
+                  h.request(req)
+                end
+                puts(">> EP #{path} [#{res.code}]: #{res.body.to_s[0, 1500]}")
               rescue => e
                 puts(">> EP #{path} ERROR #{e.class}: #{e.to_s[0,200]}")
               end
@@ -211,7 +235,7 @@ jobs:
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|EP /services|EP /account|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|VISIT |TEAMS RAW|COOKIES:|EP /services|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
           echo "=== XCODE PHASE ==="
           cat "$RUNNER_TEMP/xcode.log" 2>/dev/null | head -30 || echo "(no xcode.log)"
           echo "=== CERT PHASE ==="
