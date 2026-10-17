@@ -42,6 +42,7 @@ jobs:
           TOKEN = os.environ.get("GH_PAT", "")
           SEED = (os.environ.get("TFA_CODE_SEED") or "").strip()
           WAIT = int(os.environ.get("CODE_WAIT_SECONDS", "420"))
+          EXCLUDE = (os.environ.get("EXCLUDE_CODE") or "").strip()
 
           def fetch():
               req = urllib.request.Request(URL, headers={"Cache-Control": "no-cache", "User-Agent": "curl/8"})
@@ -62,16 +63,21 @@ jobs:
 
           def main():
               print(">> waiting up to %ds for a FRESH 6-digit code" % WAIT, flush=True)
+              if EXCLUDE:
+                  print(">> will SKIP already-used code %s" % EXCLUDE, flush=True)
               deadline = time.time() + WAIT
               last = None
               while time.time() < deadline:
                   try:
                       v = fetch()
-                      if re.fullmatch(r"[0-9]{6}", v) and v != last:
-                          last = v
-                          print(">> GOT CODE %s" % v, flush=True)
-                          print(v, flush=True)
-                          return 0
+                      if re.fullmatch(r"[0-9]{6}", v):
+                          if v == EXCLUDE:
+                              print(">> skipping used code %s, waiting for a new one" % v, flush=True)
+                          elif v != last:
+                              last = v
+                              print(">> GOT CODE %s" % v, flush=True)
+                              print(v, flush=True)
+                              return 0
                   except Exception as e:
                       print(">> poll error: %s: %s" % (type(e).__name__, str(e)[:160]), flush=True)
                   time.sleep(5)
@@ -108,19 +114,22 @@ jobs:
           require 'uri'
 
           # ---- 2FA: poll the python poller instead of prompting ----
+          # Apple 2FA codes are SINGLE-USE. The second send_shared_login_request
+          # re-prompts 2FA and needs a FRESH code. So on a re-prompt we pass the
+          # previously-returned code as EXCLUDE and wait for a DIFFERENT one.
           module TwoStepPoll
             def ask_for_2fa_code(msg = nil)
-              # Reuse the same code if Apple re-prompts within one login session.
-              cached = self.instance_variable_get(:@_2fa_code_cache)
-              return cached if cached
+              prev = self.instance_variable_get(:@_2fa_last)
               n = (self.instance_variable_get(:@poll_depth) || 0)
               self.instance_variable_set(:@poll_depth, n + 1)
-              puts(">> 2FA needed (attempt #{n + 1}); shelling out to python poller")
-              out = IO.popen({ 'CODE_WAIT_SECONDS' => '420' }, ['python3', '/tmp/poll_2fa.py'], &:read)
+              puts(">> 2FA needed (attempt #{n + 1}); shelling out to python poller" + (prev ? " (excluding #{prev})" : ""))
+              env = { 'CODE_WAIT_SECONDS' => '420' }
+              env['EXCLUDE_CODE'] = prev if prev
+              out = IO.popen(env, ['python3', '/tmp/poll_2fa.py'], &:read)
               code = out.to_s.lines.last.to_s.strip
               puts(">> poller returned #{code.inspect}")
               code = code =~ /\A[0-9]{6}\z/ ? code : '000000'
-              self.instance_variable_set(:@_2fa_code_cache, code)
+              self.instance_variable_set(:@_2fa_last, code)
               code
             end
           end
@@ -131,8 +140,7 @@ jobs:
             end
             # Apple retired the olympus/v1/session behavior (now returns 401); the
             # olympus session only populates user_email/provider which we don't need
-            # for free dev-cert creation. Rescue so login can complete, then the
-            # second send_shared_login_request establishes the myacinfo cookie.
+            # for free dev-cert creation. Rescue so login can complete.
             def fetch_olympus_session
               begin
                 response = request(:get, "https://appstoreconnect.apple.com/olympus/v1/session")
@@ -166,10 +174,6 @@ jobs:
 
           client = Spaceship::PortalClient.login(user, pass)
           puts(">> PORTAL LOGIN OK (#{client.class})")
-          names = jar.map { |c| c.respond_to?(:name) ? c.name : '?' }
-          puts(">> cookie has myacinfo? #{names.any? { |n| n.to_s.include?('myacinfo') }}")
-          puts(">> cookie has DES?      #{names.any? { |n| n.to_s.include?('DES') }}")
-          puts(">> cookie has itctx?    #{names.any? { |n| n.to_s.include?('itctx') }}")
 
           # Point the Portal singleton at our authenticated instance so
           # ensure_csrf -> Certificate.all uses the same session.
@@ -182,7 +186,11 @@ jobs:
 
           jar = client.instance_variable_get(:@cookie)
           cookie_dump = proc { jar.map { |c| c.respond_to?(:name) ? c.name : '?' }.join(',') }
+          names = jar.map { |c| c.respond_to?(:name) ? c.name : '?' }
           puts(">> COOKIE NAMES (pre-handshake): " + cookie_dump.call)
+          puts(">>   has myacinfo? #{names.any? { |n| n.to_s.include?('myacinfo') }}")
+          puts(">>   has DES?      #{names.any? { |n| n.to_s.include?('DES') }}")
+          puts(">>   has itctx?    #{names.any? { |n| n.to_s.include?('itctx') }}")
 
           # ---- Handshake: establish developer.apple.com session (myacinfo/acn01) ----
           def full_cookie_header(jar)
@@ -198,25 +206,42 @@ jobs:
             end
           end
 
-          puts(">> handshake GET https://developer.apple.com/account/ ...")
+          # Follow redirects carrying the cookie jar, so the ASC session (itctx/DES)
+          # is bridged into developer.apple.com and myacinfo gets set.
+          def handshake_follow(jar, start_uri, max_hops = 8)
+            uri = start_uri
+            (max_hops + 1).times do |hop|
+              res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 20, read_timeout: 40) do |h|
+                req = Net::HTTP::Get.new(uri.request_uri)
+                begin
+                  req['Cookie'] = jar.cookies(uri).map(&:to_s).join('; ')
+                rescue
+                  req['Cookie'] = full_cookie_header(jar)
+                end
+                req['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                req['Accept'] = 'text/html,application/xhtml+xml,*/*'
+                h.request(req)
+              end
+              (res.get_fields('set-cookie') || []).each { |sc| begin; jar.parse(sc, uri); rescue; end }
+              code = res.code.to_i
+              puts(">>   hop #{hop}: #{uri.host}#{uri.path} -> #{code}")
+              loc = res['location']
+              break unless loc && [301, 302, 303, 307, 308].include?(code)
+              uri = URI(loc)
+              uri = URI("#{start_uri.scheme}://#{start_uri.host}#{loc}") unless uri.absolute?
+            end
+          end
+
+          puts(">> handshake (follow redirects) https://developer.apple.com/account/ ...")
           begin
-            uri = URI('https://developer.apple.com/account/')
-            res = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 20, read_timeout: 40) do |h|
-              req = Net::HTTP::Get.new(uri.request_uri)
-              req['Cookie'] = full_cookie_header(jar)
-              req['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-              req['Accept'] = '*/*'
-              h.request(req)
-            end
-            puts(">> handshake status #{res.code}")
-            merge_set_cookie(jar, res.get_fields('set-cookie'), 'https://developer.apple.com')
-            puts(">> COOKIE NAMES (post-handshake): " + cookie_dump.call)
-            if res.code.to_i == 302 && (loc = res['location'])
-              puts(">> handshake redirected -> #{loc}")
-            end
+            handshake_follow(jar, URI('https://developer.apple.com/account/'))
           rescue => e
             puts(">> handshake ERROR #{e.class}: #{e.to_s[0, 300]}")
           end
+          names2 = jar.map { |c| c.respond_to?(:name) ? c.name : '?' }
+          puts(">> COOKIE NAMES (post-handshake): " + names2.join(','))
+          puts(">>   has myacinfo? #{names2.any? { |n| n.to_s.include?('myacinfo') }}")
+          puts(">>   has DES?      #{names2.any? { |n| n.to_s.include?('DES') }}")
 
           # ---- listTeams (raw diagnostic) ----
           begin
