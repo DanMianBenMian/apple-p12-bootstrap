@@ -9,33 +9,91 @@ on:
 jobs:
   make-cert:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       APPLE_ID: mocswpkddhxa@aniimate.net
+      # Apple retired GET /olympus/v1/app/config (now 404), so spaceship can no longer
+      # discover X-Apple-Widget-Key on its own. This is the long-standing public
+      # fallback key that Apple still accepts on idmsa.apple.com.
+      APPLE_WIDGET_KEY: e0b80c3bf78523bfe80974d320935bfa30add02e1bff88ec2166c6bd5a706c42
     steps:
-      - name: Recon - toolchain + DS2 team endpoints in Xcode
-        timeout-minutes: 2
+      - name: Seed widget key + patch spaceship
         run: |
-          echo "=== Xcode ==="; xcodebuild -version 2>&1 | head -3
-          echo "=== fastlane ==="; fastlane --version 2>&1 | head -2
-          echo "=== DS2 team-related action names (bounded 60s) ==="
-          timeout 60 grep -rhaoE '[a-zA-Z]{3,40}[Tt]eam[a-zA-Z]{0,20}\.action' /Applications/Xcode.app/Contents/SharedFrameworks/DVTFoundation.framework 2>/dev/null | sort -u | head -20 || echo "(grep timed out or nothing)"
-          echo "=== recon done ==="
+          set -eux
+          # 1) spaceship reads this file BEFORE hitting Apple (client.rb:723-724)
+          echo -n "$APPLE_WIDGET_KEY" > /tmp/spaceship_itc_service_key.txt
+          wc -c /tmp/spaceship_itc_service_key.txt
+          # 2) belt-and-braces: force the method to always return the key
+          cat > /tmp/widgetkey_patch.rb <<'RUBY'
+          module WidgetKeyPatch
+            def itc_service_key
+              @service_key ||= ENV['APPLE_WIDGET_KEY']
+            end
+          end
+          RUBY
+          echo "patch written"
+          xcodebuild -version
 
       - name: fastlane login + create development certificate
         env:
           FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           FASTLANE_DONT_STORE_PASSWORD: '1'
+          RUBYOPT: '-r/tmp/widgetkey_patch.rb'
+          FASTLANE_OPT_OUT_USAGE: '1'
         run: |
           set -x
           WORK=$(mktemp -d); cd "$WORK"
+          set +e
           printf '%s\n%s\n' "$FASTLANE_PASSWORD" "${{ inputs.tfa_code }}" | \
-            fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tail -60
+            fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert.log | tail -80
+          echo "fastlane exit: ${PIPESTATUS[1]}"
+          set -e
           echo "=== produced files ==="
           ls -la
-          for c in *.cer; do
-            [ -f "$c" ] && openssl x509 -in "$c" -noout -subject -dates -serial
+          for c in *.cer *.p12; do
+            [ -f "$c" ] && echo "--- $c ---" && openssl x509 -in "$c" -noout -subject -dates -serial 2>/dev/null
           done
+          cp cert.log "$RUNNER_TEMP/cert.log" 2>/dev/null || true
+
+      - name: Diagnose - what does the account actually have?
+        if: always()
+        env:
+          FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          FASTLANE_DONT_STORE_PASSWORD: '1'
+          FASTLANE_OPT_OUT_USAGE: '1'
+        run: |
+          set +e
+          WORK=$(mktemp -d); cd "$WORK"
+          cat > diag.rb <<'RUBY'
+          require 'spaceship'
+          user  = ENV['APPLE_ID']
+          pass  = ENV['FASTLANE_PASSWORD']
+          code  = ARGV[0].to_s
+          key   = ENV['APPLE_WIDGET_KEY']
+          def Spaceship::Client.itc_service_key; @service_key ||= ENV['APPLE_WIDGET_KEY']; end
+          $stdout.sync = true
+          begin
+            puts ">> login as #{user}"
+            Spaceship::PortalClient.login(user, pass)
+            puts ">> PORTAL LOGIN OK"
+            puts "teams: #{Spaceship::PortalClient.teams.map { |t| [t['name'], t['role'], t['teamId']].inspect }.join(' | ')}"
+            begin
+              certs = Spaceship::PortalClient.certificate_list
+              puts ">> #{certs.size} certificates"
+              certs.each { |c| puts "   #{c['name']} | #{c['certificate_id']} | #{Time.at(c['expirationDate'].to_i / 1000 rescue 0)}" }
+            rescue => e
+              puts ">> cert list failed: #{e.class}: #{e.to_s[0,300]}"
+            end
+          rescue => e
+            puts ">> ERROR #{e.class}: #{e.to_s[0,500]}"
+            puts e.backtrace.first(12).join("\n")
+          end
+          RUBY
+          printf '%s\n%s\n%s\n%s\n' "$FASTLANE_PASSWORD" "$code" "$code" "$code" | \
+            ruby diag.rb "${{ inputs.tfa_code }}" 2>&1 | tee diag.log | tail -60
+          cp diag.log "$RUNNER_TEMP/diag.log" 2>/dev/null || true
+          # also dump the cert log's key lines for post-mortem
+          grep -iE 'error|invalid|2fa|two.factor|locked|denied|entitlement|team|widget' cert.log 2>/dev/null | head -40 || true
 
       - name: Upload artifacts (cert / p12 / logs)
         if: always()
@@ -43,7 +101,5 @@ jobs:
         with:
           name: apple-cert-output
           path: |
-            *.p12
-            *.cer
-            *.log
+            ${{ runner.temp }}/*.log
           if-no-files-found: warn
