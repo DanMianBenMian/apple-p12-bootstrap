@@ -129,7 +129,7 @@ jobs:
             end
           end
           puts(">> DONE logged_in=#{logged_in}")
-          R
+          RUBY
           printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee cert.log
           cp cert.log "$RUNNER_TEMP/" 2>/dev/null || true
 
@@ -152,7 +152,7 @@ jobs:
               @service_key ||= ENV['APPLE_WIDGET_KEY']
             end
           end
-          R
+          RUBY
           printf '%s\n' "$FASTLANE_PASSWORD" | \
             timeout 900 ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
           echo "=== files ==="
