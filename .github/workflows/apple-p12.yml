@@ -21,53 +21,50 @@ jobs:
       APPLE_WIDGET_KEY: e0b80c3bf78523bfe80974d320935bfa30add02e1bff88ec2166c6bd5a706c42
       CODE_POLL_URL: https://raw.githubusercontent.com/DanMianBenMian/apple-p12-bootstrap/main/2fa_code.txt
     steps:
-      - name: Seed widget key + write 2FA poller patch
+      - name: Seed widget key + install 2FA poller
         run: |
           set -eu
           # spaceship reads this file BEFORE hitting Apple (client.rb:723-724)
           echo -n "$APPLE_WIDGET_KEY" > /tmp/spaceship_itc_service_key.txt
           echo "widget key bytes: $(wc -c < /tmp/spaceship_itc_service_key.txt)"
 
-          cat > /tmp/twostep_patch.rb <<'RUBY'
-          module TwoStepPoll
-            def ask_for_2fa_code(msg)
-              url  = ENV['CODE_POLL_URL']
-              seed = ENV['TFA_CODE_SEED'].to_s.strip
-              n = (self.instance_variable_get(:@poll_depth) || 0)
-              self.instance_variable_set(:@poll_depth, n + 1)
-              puts(">> 2FA poll attempt ##{n + 1}; waiting for a FRESH code via #{url}")
-
-              require 'net/http'
-              require 'uri'
-              deadline = Time.now + 420
-              last = nil
-              until Time.now > deadline
-                begin
-                  # plain positional args only: Net::HTTP.start(host, port, opts) where
-                  # opts MUST be a Hash (Ruby 3 kwarg-splitting rejects bare keywords)
-                  uri = URI(url + (url.include?('?') ? '&' : '?') + 't=' + Time.now.to_i)
-                  res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 10, read_timeout: 10 }) do |h|
-                    h.get(uri.request_uri, { 'Cache-Control' => 'no-cache' })
-                  end
-                  val = res.body.to_s.strip
-                  if val =~ /\A[0-9]{6}\z/ && val != last
-                    last = val
-                    puts(">> got code #{val}, submitting")
-                    return val
-                  end
-                  puts(">> poll ok, no 6-digit value yet (code=#{res.code} body=#{val[0,30].inspect})")
-                rescue => e
-                  puts(">> poll error: #{e.class}: #{e.to_s[0,200]}")
-                end
-                sleep 5
-              end
-              puts(">> TIMED OUT waiting for a 2FA code")
-              return seed.empty? ? '000000' : seed
-            end
-          end
-          RUBY
-          echo "patch written"
-          ruby -c /tmp/twostep_patch.rb && echo "SYNTAX OK"
+          cat > /tmp/poll_2fa.py <<'PYEOF'
+          import os, re, sys, time, urllib.request
+          URL = os.environ.get("CODE_POLL_URL", "")
+          SEED = (os.environ.get("TFA_CODE_SEED") or "").strip()
+          WAIT = int(os.environ.get("CODE_WAIT_SECONDS", "420"))
+          def fetch():
+              sep = "&" if "?" in URL else "?"
+              u = URL + sep + "t=" + str(int(time.time()))
+              req = urllib.request.Request(u, headers={"Cache-Control": "no-cache", "User-Agent": "curl/8"})
+              r = urllib.request.urlopen(req, timeout=15)
+              body = r.read().decode("utf-8", "replace").strip()
+              print(">> poll http=%s body=%r" % (r.status, body[:40]), flush=True)
+              return body
+          def main():
+              print(">> waiting up to %ds for a FRESH 6-digit code" % WAIT, flush=True)
+              deadline = time.time() + WAIT
+              last = None
+              while time.time() < deadline:
+                  try:
+                      v = fetch()
+                      if re.fullmatch(r"[0-9]{6}", v) and v != last:
+                          last = v
+                          print(">> GOT CODE %s" % v, flush=True)
+                          print(v, flush=True)
+                          return 0
+                  except Exception as e:
+                      print(">> poll error: %s: %s" % (type(e).__name__, str(e)[:160]), flush=True)
+                  time.sleep(5)
+              print(">> TIMED OUT waiting for a 2FA code; falling back to seed", flush=True)
+              print(SEED if SEED else "000000", flush=True)
+              return 0
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -c "import py_compile; py_compile.compile('/tmp/poll_2fa.py', doraise=True); print('PY SYNTAX OK')"
+          head -3 /tmp/poll_2fa.py
+          echo "installer ok"
 
       - name: Login + create development certificate
         timeout-minutes: 15
@@ -83,7 +80,19 @@ jobs:
           cat > runner.rb <<'RUBY'
           require 'spaceship'
           require 'timeout'
-          load '/tmp/twostep_patch.rb'
+
+          module TwoStepPoll
+            def ask_for_2fa_code(msg)
+              n = (self.instance_variable_get(:@poll_depth) || 0)
+              self.instance_variable_set(:@poll_depth, n + 1)
+              puts(">> 2FA needed (attempt #{n + 1}); shelling out to python poller")
+              out = IO.popen({'CODE_WAIT_SECONDS' => '420'}, ['python3', '/tmp/poll_2fa.py'], &:read)
+              code = out.to_s.lines.last.to_s.strip
+              puts(">> poller returned #{code.inspect}")
+              code =~ /\A[0-9]{6}\z/ ? code : '000000'
+            end
+          end
+
           Spaceship::Client.prepend(TwoStepPoll)
           Spaceship::Client.class_eval do
             def itc_service_key
@@ -107,11 +116,9 @@ jobs:
             puts(e.backtrace.first(12).join("\n"))
           end
 
-          # Persist the session so the cert step can reuse it without a second login
           if logged_in
             begin
-              sess = Spaceship::PortalClient.instance_variable_get(:@cookie).to_s
-              File.write('/tmp/fastlane_session.txt', sess) rescue nil
+              File.write('/tmp/fastlane_session.txt', Spaceship::PortalClient.instance_variable_get(:@cookie).to_s) rescue nil
             rescue
             end
             [
@@ -130,6 +137,7 @@ jobs:
           end
           puts(">> DONE logged_in=#{logged_in}")
           RUBY
+          ruby -c runner.rb && echo "RUBY SYNTAX OK"
           printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee cert.log
           cp cert.log "$RUNNER_TEMP/" 2>/dev/null || true
 
@@ -145,7 +153,15 @@ jobs:
           WORK=$(mktemp -d); cd "$WORK"
           cat > patch2.rb <<'RUBY'
           require 'spaceship'
-          load '/tmp/twostep_patch.rb'
+          module TwoStepPoll
+            def ask_for_2fa_code(msg)
+              puts(">> 2FA needed; shelling out to python poller")
+              out = IO.popen({'CODE_WAIT_SECONDS' => '420'}, ['python3', '/tmp/poll_2fa.py'], &:read)
+              code = out.to_s.lines.last.to_s.strip
+              puts(">> poller returned #{code.inspect}")
+              code =~ /\A[0-9]{6}\z/ ? code : '000000'
+            end
+          end
           Spaceship::Client.prepend(TwoStepPoll)
           Spaceship::Client.class_eval do
             def itc_service_key
@@ -153,8 +169,9 @@ jobs:
             end
           end
           RUBY
+          ruby -c patch2.rb && echo "RUBY SYNTAX OK"
           printf '%s\n' "$FASTLANE_PASSWORD" | \
-            timeout 900 ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
+            ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
           echo "=== files ==="
           ls -la
           for c in *.cer *.p12; do
@@ -166,9 +183,9 @@ jobs:
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE '2FA poll|got code|PORTAL LOGIN|TEAMS|CERTS|PROFILES|TIMED OUT|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|TEAMS|CERTS|PROFILES|TIMED OUT|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
           echo "=== CERT PHASE ==="
-          grep -inE '2FA poll|got code|successfully|created|TIMED OUT|Incorrect|Unauthorized|certificate' "$RUNNER_TEMP/cert2.log" 2>/dev/null | head -40
+          grep -inE '2FA needed|poller returned|GOT CODE|successfully|created|TIMED OUT|Incorrect|Unauthorized|certificate' "$RUNNER_TEMP/cert2.log" 2>/dev/null | head -40
 
       - name: Upload artifacts
         if: always()
