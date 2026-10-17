@@ -110,19 +110,50 @@ jobs:
           # ---- 2FA: poll the python poller instead of prompting ----
           module TwoStepPoll
             def ask_for_2fa_code(msg = nil)
+              # Reuse the same code if Apple re-prompts within one login session.
+              cached = self.instance_variable_get(:@_2fa_code_cache)
+              return cached if cached
               n = (self.instance_variable_get(:@poll_depth) || 0)
               self.instance_variable_set(:@poll_depth, n + 1)
               puts(">> 2FA needed (attempt #{n + 1}); shelling out to python poller")
               out = IO.popen({ 'CODE_WAIT_SECONDS' => '420' }, ['python3', '/tmp/poll_2fa.py'], &:read)
               code = out.to_s.lines.last.to_s.strip
               puts(">> poller returned #{code.inspect}")
-              code =~ /\A[0-9]{6}\z/ ? code : '000000'
+              code = code =~ /\A[0-9]{6}\z/ ? code : '000000'
+              self.instance_variable_set(:@_2fa_code_cache, code)
+              code
             end
           end
           Spaceship::Client.prepend(TwoStepPoll)
           Spaceship::Client.class_eval do
             def itc_service_key
               @service_key ||= ENV['APPLE_WIDGET_KEY']
+            end
+            # Apple retired the olympus/v1/session behavior (now returns 401); the
+            # olympus session only populates user_email/provider which we don't need
+            # for free dev-cert creation. Rescue so login can complete, then the
+            # second send_shared_login_request establishes the myacinfo cookie.
+            def fetch_olympus_session
+              begin
+                response = request(:get, "https://appstoreconnect.apple.com/olympus/v1/session")
+                body = response.body
+                if body
+                  body = JSON.parse(body) if body.kind_of?(String)
+                  user_map = body["user"]
+                  if user_map
+                    self.user_email = user_map["emailAddress"]
+                  end
+                  provider = body["provider"]
+                  if provider
+                    self.provider = Spaceship::Provider.new(provider_hash: provider)
+                    return true
+                  end
+                end
+                return false
+              rescue => e
+                puts(">> fetch_olympus_session rescued: #{e.class}: #{e.to_s[0,200]}")
+                return false
+              end
             end
           end
 
