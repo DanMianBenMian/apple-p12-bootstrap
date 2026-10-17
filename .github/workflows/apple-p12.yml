@@ -14,15 +14,12 @@ jobs:
       APPLE_ID: mocswpkddhxa@aniimate.net
     steps:
       - name: Recon - toolchain + DS2 team endpoints in Xcode
+        timeout-minutes: 2
         run: |
           echo "=== Xcode ==="; xcodebuild -version 2>&1 | head -3
           echo "=== fastlane ==="; fastlane --version 2>&1 | head -2
-          echo "=== DS2 team-related action names inside Xcode ==="
-          for fw in /Applications/Xcode.app/Contents/SharedFrameworks/DVTFoundation.framework /Applications/Xcode.app/Contents/Frameworks; do
-            grep -rhaoE '[a-zA-Z]{3,40}[Tt]eam[a-zA-Z]{0,20}\.action' "$fw" 2>/dev/null
-          done | sort -u | head -20
-          echo "=== grep createTeam/enroll strings ==="
-          grep -rhaoE '(createTeam|enrollTeam|joinTeam|personalTeam)[A-Za-z]{0,20}' /Applications/Xcode.app/Contents/ 2>/dev/null | sort -u | head -10
+          echo "=== DS2 team-related action names (bounded 60s) ==="
+          timeout 60 grep -rhaoE '[a-zA-Z]{3,40}[Tt]eam[a-zA-Z]{0,20}\.action' /Applications/Xcode.app/Contents/SharedFrameworks/DVTFoundation.framework 2>/dev/null | sort -u | head -20 || echo "(grep timed out or nothing)"
           echo "=== recon done ==="
 
       - name: fastlane login + create development certificate
