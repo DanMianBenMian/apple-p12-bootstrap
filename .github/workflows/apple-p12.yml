@@ -166,6 +166,10 @@ jobs:
 
           client = Spaceship::PortalClient.login(user, pass)
           puts(">> PORTAL LOGIN OK (#{client.class})")
+          names = jar.map { |c| c.respond_to?(:name) ? c.name : '?' }
+          puts(">> cookie has myacinfo? #{names.any? { |n| n.to_s.include?('myacinfo') }}")
+          puts(">> cookie has DES?      #{names.any? { |n| n.to_s.include?('DES') }}")
+          puts(">> cookie has itctx?    #{names.any? { |n| n.to_s.include?('itctx') }}")
 
           # Point the Portal singleton at our authenticated instance so
           # ensure_csrf -> Certificate.all uses the same session.
