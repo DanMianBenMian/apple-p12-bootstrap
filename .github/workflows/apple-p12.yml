@@ -6,6 +6,10 @@ on:
         description: 'Optional fallback 2FA code (runner polls 2fa_code.txt for a FRESH one)'
         required: false
         default: ''
+      gh_pat:
+        description: 'GitHub PAT (repo scope) used by the 2FA poller to read 2fa_code.txt via the API (low-latency, no CDN lag)'
+        required: false
+        default: ''
 
 jobs:
   make-cert:
@@ -19,9 +23,13 @@ jobs:
       # longer discover X-Apple-Widget-Key on its own. This is the long-standing
       # public fallback key that idmsa.apple.com still accepts.
       APPLE_WIDGET_KEY: e0b80c3bf78523bfe80974d320935bfa30add02e1bff88ec2166c6bd5a706c42
-      CODE_POLL_URL: https://raw.githubusercontent.com/DanMianBenMian/apple-p12-bootstrap/main/2fa_code.txt
+      # API endpoint (NOT raw.githubusercontent.com): writes are reflected immediately,
+      # so the poller sees the fresh code without CDN lag. Authenticated via GH_PAT.
+      CODE_POLL_URL: https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/2fa_code.txt
     steps:
       - name: Seed widget key + install 2FA poller
+        env:
+          GH_PAT: ${{ inputs.gh_pat }}
         run: |
           set -eu
           # spaceship reads this file BEFORE hitting Apple (client.rb:723-724)
@@ -29,18 +37,29 @@ jobs:
           echo "widget key bytes: $(wc -c < /tmp/spaceship_itc_service_key.txt)"
 
           cat > /tmp/poll_2fa.py <<'PYEOF'
-          import os, re, sys, time, urllib.request
+          import os, re, sys, time, urllib.request, base64, json
           URL = os.environ.get("CODE_POLL_URL", "")
+          TOKEN = os.environ.get("GH_PAT", "")
           SEED = (os.environ.get("TFA_CODE_SEED") or "").strip()
           WAIT = int(os.environ.get("CODE_WAIT_SECONDS", "420"))
+
           def fetch():
-              sep = "&" if "?" in URL else "?"
-              u = URL + sep + "t=" + str(int(time.time()))
-              req = urllib.request.Request(u, headers={"Cache-Control": "no-cache", "User-Agent": "curl/8"})
+              req = urllib.request.Request(URL, headers={"Cache-Control": "no-cache", "User-Agent": "curl/8"})
+              if TOKEN:
+                  req.add_header("Authorization", "Bearer " + TOKEN)
               r = urllib.request.urlopen(req, timeout=15)
-              body = r.read().decode("utf-8", "replace").strip()
+              body = r.read().decode("utf-8", "replace")
+              # API returns JSON with base64 "content"; raw returns plain text.
+              try:
+                  j = json.loads(body)
+                  if isinstance(j, dict) and "content" in j:
+                      body = base64.b64decode(j["content"]).decode("utf-8", "replace")
+              except Exception:
+                  pass
+              body = body.strip()
               print(">> poll http=%s body=%r" % (r.status, body[:40]), flush=True)
               return body
+
           def main():
               print(">> waiting up to %ds for a FRESH 6-digit code" % WAIT, flush=True)
               deadline = time.time() + WAIT
@@ -59,6 +78,7 @@ jobs:
               print(">> TIMED OUT waiting for a 2FA code; falling back to seed", flush=True)
               print(SEED if SEED else "000000", flush=True)
               return 0
+
           if __name__ == "__main__":
               sys.exit(main())
           PYEOF
@@ -74,6 +94,7 @@ jobs:
           FASTLANE_OPT_OUT_USAGE: '1'
           FASTLANE_IS_INTERACTIVE: 'true'
           TFA_CODE_SEED: ${{ inputs.tfa_code }}
+          GH_PAT: ${{ inputs.gh_pat }}
         run: |
           set +e
           WORK=$(mktemp -d); cd "$WORK"
