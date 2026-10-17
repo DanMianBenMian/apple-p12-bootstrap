@@ -1,0 +1,58 @@
+name: aoskit-anisette-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Probe AOSKit native anisette (real Apple ADI)
+        run: |
+          set +e
+          python3 -m venv /tmp/av
+          /tmp/av/bin/pip install -q pyobjc-framework-Cocoa 2>&1 | tail -3
+          cat > /tmp/probe.py <<'EOF'
+          import objc, traceback
+          from Foundation import NSBundle, NSClassFromString
+
+          print("=== AOSKit anisette probe ===", flush=True)
+          try:
+              b = NSBundle.bundleWithPath_("/System/Library/PrivateFrameworks/AOSKit.framework")
+              print("BUNDLE:", b, flush=True)
+              if b is None:
+                  print("AOSKit.framework NOT PRESENT", flush=True)
+                  raise SystemExit(0)
+              ok = b.load()
+              print("bundle loaded:", ok, flush=True)
+              objc.loadBundleFunctions(b, globals(), [("retrieveOTPHeadersForDSID", b"")])
+              util = NSClassFromString("AOSUtilities")
+              print("AOSUtilities:", util, flush=True)
+              h = util.retrieveOTPHeadersForDSID_("-2")
+              print("HEADERS:", h, flush=True)
+              if h:
+                  for k in ("X-Apple-MD", "X-Apple-MD-M"):
+                      v = h.get(k)
+                      print("  %-14s present=%s len=%s" % (k, v is not None, (len(v) if v else 0)), flush=True)
+              else:
+                  print(">>> NO HEADERS: ADI not provisioned on this machine", flush=True)
+          except Exception:
+              traceback.print_exc()
+
+          print("=== fallback: does AuthKit/akd exist? ===", flush=True)
+          import os
+          for p in ("/System/Library/PrivateFrameworks/AuthKit.framework",
+                    "/System/Library/PrivateFrameworks/AppleDeviceIdentity.framework",
+                    "/usr/libexec/akd"):
+              print("  %s -> %s" % (p, os.path.exists(p)), flush=True)
+          print("=== machine identity hints ===", flush=True)
+          import subprocess
+          for cmd in ("ioreg -rd1 -c IOPlatformExpertDevice | grep -E 'IOPlatformSerialNumber|IOPlatformUUID'",
+                      "system_profiler SPHardwareDataType | grep -E 'Serial|Hardware UUID'"):
+              try:
+                  out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout.strip()
+                  print("  %s => %s" % (cmd[:40], out.replace("\n", " | ")[:200]), flush=True)
+              except Exception as e:
+                  print("  cmd failed:", e, flush=True)
+          EOF
+          /tmp/av/bin/python /tmp/probe.py
