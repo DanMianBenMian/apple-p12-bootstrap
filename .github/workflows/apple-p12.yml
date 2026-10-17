@@ -43,10 +43,11 @@ jobs:
               last = nil
               until Time.now > deadline
                 begin
+                  # plain positional args only: Net::HTTP.start(host, port, opts) where
+                  # opts MUST be a Hash (Ruby 3 kwarg-splitting rejects bare keywords)
                   uri = URI(url + (url.include?('?') ? '&' : '?') + 't=' + Time.now.to_i)
-                  res = Net::HTTP.start(uri.host, uri.port, use_ssl: true,
-                                        open_timeout: 10, read_timeout: 10) do |h|
-                    h.get(uri.request_uri, 'Cache-Control' => 'no-cache')
+                  res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 10, read_timeout: 10 }) do |h|
+                    h.get(uri.request_uri, { 'Cache-Control' => 'no-cache' })
                   end
                   val = res.body.to_s.strip
                   if val =~ /\A[0-9]{6}\z/ && val != last
@@ -54,8 +55,9 @@ jobs:
                     puts(">> got code #{val}, submitting")
                     return val
                   end
+                  puts(">> poll ok, no 6-digit value yet (code=#{res.code} body=#{val[0,30].inspect})")
                 rescue => e
-                  puts(">> poll error: #{e.class}: #{e.to_s[0,120]}")
+                  puts(">> poll error: #{e.class}: #{e.to_s[0,200]}")
                 end
                 sleep 5
               end
@@ -65,9 +67,10 @@ jobs:
           end
           RUBY
           echo "patch written"
-          ruby -c /tmp/twostep_patch.rb
+          ruby -c /tmp/twostep_patch.rb && echo "SYNTAX OK"
 
       - name: Login + create development certificate
+        timeout-minutes: 15
         env:
           FASTLANE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           FASTLANE_DONT_STORE_PASSWORD: '1'
@@ -79,6 +82,7 @@ jobs:
           WORK=$(mktemp -d); cd "$WORK"
           cat > runner.rb <<'RUBY'
           require 'spaceship'
+          require 'timeout'
           load '/tmp/twostep_patch.rb'
           Spaceship::Client.prepend(TwoStepPoll)
           Spaceship::Client.class_eval do
@@ -92,21 +96,40 @@ jobs:
           user = ENV['APPLE_ID']
           pass = ENV['FASTLANE_PASSWORD']
 
+          logged_in = false
           begin
             puts(">> portal login as #{user}")
             Spaceship::PortalClient.login(user, pass)
+            logged_in = true
             puts(">> PORTAL LOGIN OK")
-            teams = Spaceship::PortalClient.teams
-            puts(">> TEAMS: " + teams.map { |t| [t['name'], t['role'], t['teamId']].inspect }.join(' | '))
-            certs = Spaceship::PortalClient.certificate_list
-            puts(">> CERTIFICATES: #{certs.size}")
-            certs.each { |c| puts("   #{c['name']} | #{c['certificate_id']}") }
-            puts(">> RUN_LIST: " + Spaceship::PortalClient.runners.map { |r| r['name'] }.inspect)
           rescue => e
-            puts(">> PORTAL ERROR #{e.class}: #{e.to_s[0,600]}")
-            puts(e.backtrace.first(15).join("\n"))
+            puts(">> PORTAL LOGIN ERROR #{e.class}: #{e.to_s[0,600]}")
+            puts(e.backtrace.first(12).join("\n"))
           end
-          RUBY
+
+          # Persist the session so the cert step can reuse it without a second login
+          if logged_in
+            begin
+              sess = Spaceship::PortalClient.instance_variable_get(:@cookie).to_s
+              File.write('/tmp/fastlane_session.txt', sess) rescue nil
+            rescue
+            end
+            [
+              ["teams",   proc { Spaceship::PortalClient.teams.map { |t| [t['name'], t['role'], t['teamId']].inspect }.join(' | ') }],
+              ["certs",   proc { c = Spaceship::PortalClient.certificate_list; "count=#{c.size} :: " + c.map { |x| "#{x['name']}/#{x['certificate_id']}" }.join(' ; ') }],
+              ["profiles",proc { Spaceship::PortalClient.profile.map { |p| p['name'] }.join(', ') }],
+            ].each do |label, blk|
+              begin
+                puts(">> #{label.upcase}: " + Timeout.timeout(90) { blk.call }.to_s)
+              rescue Timeout::Error
+                puts(">> #{label.upcase}: TIMED OUT after 90s")
+              rescue => e
+                puts(">> #{label.upcase} ERROR #{e.class}: #{e.to_s[0,200]}")
+              end
+            end
+          end
+          puts(">> DONE logged_in=#{logged_in}")
+          R
           printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee cert.log
           cp cert.log "$RUNNER_TEMP/" 2>/dev/null || true
 
@@ -117,7 +140,6 @@ jobs:
           FASTLANE_OPT_OUT_USAGE: '1'
           FASTLANE_IS_INTERACTIVE: 'true'
           TFA_CODE_SEED: ${{ inputs.tfa_code }}
-          RUBYOPT: '-r/tmp/twostep_patch.rb'
         run: |
           set +e
           WORK=$(mktemp -d); cd "$WORK"
@@ -131,9 +153,8 @@ jobs:
             end
           end
           R
-          # keep .p12 out of keychain prompts
           printf '%s\n' "$FASTLANE_PASSWORD" | \
-            ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
+            timeout 900 ruby -r./patch2.rb -S fastlane cert -u "$APPLE_ID" --verbose 2>&1 | tee cert2.log
           echo "=== files ==="
           ls -la
           for c in *.cer *.p12; do
@@ -145,7 +166,7 @@ jobs:
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE '2FA poll|got code|PORTAL LOGIN|TEAMS|CERTIFICATES|PORTAL ERROR|TIMED OUT|Incorrect|Unauthorized' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE '2FA poll|got code|PORTAL LOGIN|TEAMS|CERTS|PROFILES|TIMED OUT|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
           echo "=== CERT PHASE ==="
           grep -inE '2FA poll|got code|successfully|created|TIMED OUT|Incorrect|Unauthorized|certificate' "$RUNNER_TEMP/cert2.log" 2>/dev/null | head -40
 
