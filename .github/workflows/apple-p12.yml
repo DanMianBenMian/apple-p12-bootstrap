@@ -121,17 +121,26 @@ jobs:
               File.write('/tmp/fastlane_session.txt', Spaceship::PortalClient.instance_variable_get(:@cookie).to_s) rescue nil
             rescue
             end
-            [
-              ["teams",   proc { Spaceship::PortalClient.teams.map { |t| [t['name'], t['role'], t['teamId']].inspect }.join(' | ') }],
-              ["certs",   proc { c = Spaceship::PortalClient.certificate_list; "count=#{c.size} :: " + c.map { |x| "#{x['name']}/#{x['certificate_id']}" }.join(' ; ') }],
-              ["profiles",proc { Spaceship::PortalClient.profile.map { |p| p['name'] }.join(', ') }],
-            ].each do |label, blk|
+            require 'net/http'
+            require 'uri'
+            cookie = Spaceship::PortalClient.instance_variable_get(:@cookie).to_s
+            # The real Quartz-HTTP endpoint the dev portal uses
+            ["/services-account/QH65B2/listTeams.action",
+             "/services-account/QH65B2/account/getTeams",
+             "/services-account/QH65B2/listCertificates.action"].each do |path|
               begin
-                puts(">> #{label.upcase}: " + Timeout.timeout(90) { blk.call }.to_s)
-              rescue Timeout::Error
-                puts(">> #{label.upcase}: TIMED OUT after 90s")
+                uri = URI("https://developer.apple.com#{path}")
+                req = Net::HTTP::Get.new(uri.request_uri)
+                req['Cookie'] = cookie
+                req['X-Requested-With'] = 'XMLHttpRequest'
+                req['X-Apple-Widget-Key'] = ENV['APPLE_WIDGET_KEY'].to_s
+                req['User-Agent'] = 'fastlane'
+                res = Net::HTTP.start(uri.host, uri.port, { use_ssl: true, open_timeout: 15, read_timeout: 30 }) do |h|
+                  h.request(req)
+                end
+                puts(">> EP #{path} [#{res.code}]: #{res.body.to_s[0, 1200]}")
               rescue => e
-                puts(">> #{label.upcase} ERROR #{e.class}: #{e.to_s[0,200]}")
+                puts(">> EP #{path} ERROR #{e.class}: #{e.to_s[0,200]}")
               end
             end
           end
@@ -140,6 +149,25 @@ jobs:
           ruby -c runner.rb && echo "RUBY SYNTAX OK"
           printf '%s\n' "$FASTLANE_PASSWORD" | ruby runner.rb 2>&1 | tee cert.log
           cp cert.log "$RUNNER_TEMP/" 2>/dev/null || true
+
+      - name: Xcode path - does it see a Personal Team?
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set +e
+          echo "=== xcodebuild version ==="
+          xcodebuild -version
+          echo "=== security find-identity (keychain) ==="
+          security find-identity -v -p codesigning 2>&1 | head -20
+          echo "=== existing provisioning profiles ==="
+          ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/" 2>/dev/null || echo "(none)"
+          echo "=== xcodebuild first-launch state ==="
+          xcodebuild -runFirstLaunch 2>&1 | tail -5
+          cp /dev/null "$RUNNER_TEMP/xcode.log" 2>/dev/null || true
+          {
+            echo "xcodebuild: $(xcodebuild -version 2>&1 | tr '\n' ' ')"
+            echo "identities:"; security find-identity -v -p codesigning 2>&1 | head -20
+          } > "$RUNNER_TEMP/xcode.log" 2>&1
 
       - name: Create certificate via fastlane cert
         env:
@@ -183,7 +211,9 @@ jobs:
         if: always()
         run: |
           echo "=== PORTAL PHASE ==="
-          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|TEAMS|CERTS|PROFILES|TIMED OUT|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          grep -inE 'patches applied|portal login|2FA needed|poller returned|GOT CODE|EP /services|EP /account|DONE logged' "$RUNNER_TEMP/cert.log" 2>/dev/null | head -40
+          echo "=== XCODE PHASE ==="
+          cat "$RUNNER_TEMP/xcode.log" 2>/dev/null | head -30 || echo "(no xcode.log)"
           echo "=== CERT PHASE ==="
           grep -inE '2FA needed|poller returned|GOT CODE|successfully|created|TIMED OUT|Incorrect|Unauthorized|certificate' "$RUNNER_TEMP/cert2.log" 2>/dev/null | head -40
 
