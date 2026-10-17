@@ -109,12 +109,11 @@ jobs:
           client = nil
           begin
             puts(">> portal login as #{user}")
-            # NOTE: the class method builds an anonymous instance internally, so we must
-            # keep our own handle - the cookie jar lives on the instance, not the class.
-            client = Spaceship::Client.new
-            client.login(user, pass)
+            # Spaceship::Client is abstract (no self.hostname). PortalClient implements it.
+            # PortalClient.login (class method) returns the instance that holds @cookie.
+            client = Spaceship::PortalClient.login(user, pass)
             logged_in = true
-            puts(">> PORTAL LOGIN OK")
+            puts(">> PORTAL LOGIN OK (#{client.class})")
           rescue => e
             puts(">> PORTAL LOGIN ERROR #{e.class}: #{e.to_s[0,600]}")
             puts(e.backtrace.first(12).join("\n"))
