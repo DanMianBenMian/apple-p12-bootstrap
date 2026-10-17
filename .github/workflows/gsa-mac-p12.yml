@@ -1,0 +1,54 @@
+name: gsa-mac-p12
+on:
+  workflow_dispatch:
+    inputs:
+      gh_pat:
+        description: 'GitHub PAT (repo scope) for the 2FA poller - avoids the 60/hr anonymous API rate limit'
+        required: false
+        default: ''
+
+jobs:
+  make-cert:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      APPLE_ID: mocswpkddhxa@aniimate.net
+      CODE_POLL_URL: https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/2fa_code.txt
+    steps:
+      - name: Set up python deps
+        run: |
+          set -eu
+          python3 -m venv /tmp/gv
+          /tmp/gv/bin/pip install -q --upgrade pip
+          /tmp/gv/bin/pip install -q requests urllib3 cryptography srp pyobjc-framework-Cocoa
+          /tmp/gv/bin/python -c "import srp._pysrp, requests, cryptography, objc; print('deps ok')"
+
+      - name: Fetch gsa_mac.py via API (no CDN lag)
+        run: |
+          set -eu
+          curl -sL "https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/gsa_mac.py" -o /tmp/gsa.json
+          /tmp/gv/bin/python -c "import json,base64;open('/tmp/gsa_mac.py','w').write(base64.b64decode(json.load(open('/tmp/gsa.json'))['content']).decode())"
+          wc -l /tmp/gsa_mac.py
+          /tmp/gv/bin/python -m py_compile /tmp/gsa_mac.py && echo "PY SYNTAX OK"
+
+      - name: Run GSA + create cert + export p12
+        timeout-minutes: 20
+        env:
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          GH_PAT: ${{ inputs.gh_pat }}
+        run: |
+          set +e
+          /tmp/gv/bin/python /tmp/gsa_mac.py 2>&1 | tee "$RUNNER_TEMP/cert.log"
+          echo "=== artifacts ==="
+          ls -la "$RUNNER_TEMP" | grep -E 'dev\.|\.log' || echo "(none)"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-p12-output
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/*.p12
+            ${{ runner.temp }}/*.pem
+          if-no-files-found: warn
