@@ -1,0 +1,51 @@
+name: gsa-probe7
+on:
+  workflow_dispatch:
+    inputs:
+      gh_pat:
+        description: 'PAT so the runner can fetch the script'
+        required: false
+        default: ''
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      APPLE_ID: mocswpkddhxa@aniimate.net
+    steps:
+      - name: Set up python deps
+        run: |
+          set -eu
+          python3 -m venv /tmp/gv
+          /tmp/gv/bin/pip install -q --upgrade pip
+          /tmp/gv/bin/pip install -q requests urllib3 cryptography srp pyobjc-framework-Cocoa
+          /tmp/gv/bin/python -c "import srp._pysrp, requests, cryptography, objc; print('deps ok')"
+
+      - name: Fetch probe via API
+        env:
+          GH_PAT: ${{ inputs.gh_pat }}
+        run: |
+          set -eu
+          curl -sL -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/gsa_probe7.py" -o /tmp/gsa.json
+          /tmp/gv/bin/python -c "import json,base64;open('/tmp/gsa_probe7.py','w').write(base64.b64decode(json.load(open('/tmp/gsa.json'))['content']).decode())"
+          wc -l /tmp/gsa_probe7.py
+          /tmp/gv/bin/python -m py_compile /tmp/gsa_probe7.py && echo "PY SYNTAX OK"
+
+      - name: Run probe on ${{ matrix.os }}
+        run: |
+          set +e
+          /tmp/gv/bin/python /tmp/gsa_probe7.py 2>&1 | tee "$RUNNER_TEMP/probe-${{ matrix.os }}.log"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe7-${{ matrix.os }}
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: warn
