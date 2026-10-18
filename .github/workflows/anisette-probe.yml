@@ -1,0 +1,64 @@
+name: anisette-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      apple_id:
+        description: "Apple ID (optional; gsa_win.py has a hardcoded test account)"
+        required: false
+      apple_password:
+        description: "Apple ID password (optional)"
+        required: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start dadoum/anisette-server (Linux + Android libCoreADI)
+        run: |
+          docker run -d --name ani -p 6969:6969 dadoum/anisette-server:latest
+          echo "waiting for anisette-server to come up..."
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:6969/ || true)
+            echo "attempt $i: http=$code"
+            if [ "$code" = "200" ]; then echo "SERVER UP"; break; fi
+            sleep 5
+          done
+          docker logs ani || true
+
+      - name: Capture raw anisette response (for inspection)
+        run: |
+          curl -s --max-time 20 http://localhost:6969/ -o anisette_raw.json || echo "curl failed"
+          echo "--- first 600 bytes of anisette_raw.json ---"
+          head -c 600 anisette_raw.json || true
+          echo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -q requests cryptography srp
+
+      - name: Run GSA init probe (anisette acceptance test)
+        env:
+          APPLE_ID: ${{ inputs.apple_id }}
+          APPLE_PASSWORD: ${{ inputs.apple_password }}
+          ANI_URL: http://localhost:6969/
+        run: |
+          python gsa_linux.py probe 2>&1 | tee probe_out.log
+          echo "PROBE_EXIT=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Upload logs + artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anisette-probe-logs
+          path: |
+            probe_out.log
+            anisette_raw.json
+            *.json
