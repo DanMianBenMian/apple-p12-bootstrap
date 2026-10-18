@@ -1,6 +1,11 @@
 name: gsa-probe6
 on:
   workflow_dispatch:
+    inputs:
+      gh_pat:
+        description: 'PAT so the runner can fetch the script (avoids the 60/hr anonymous API cap)'
+        required: false
+        default: ''
 
 jobs:
   probe:
@@ -18,9 +23,13 @@ jobs:
           /tmp/gv/bin/python -c "import srp._pysrp, requests, cryptography, objc; print('deps ok')"
 
       - name: Fetch probe via API (no CDN lag)
+        env:
+          GH_PAT: ${{ inputs.gh_pat }}
         run: |
           set -eu
-          curl -sL "https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/gsa_probe6.py" -o /tmp/gsa.json
+          curl -sL -H "Authorization: Bearer $GH_PAT" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/DanMianBenMian/apple-p12-bootstrap/contents/gsa_probe6.py" -o /tmp/gsa.json
+          head -c 120 /tmp/gsa.json
           /tmp/gv/bin/python -c "import json,base64;open('/tmp/gsa_probe6.py','w').write(base64.b64decode(json.load(open('/tmp/gsa.json'))['content']).decode())"
           wc -l /tmp/gsa_probe6.py
           /tmp/gv/bin/python -m py_compile /tmp/gsa_probe6.py && echo "PY SYNTAX OK"
